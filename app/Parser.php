@@ -4,381 +4,364 @@ namespace App;
 
 final class Parser
 {
+    private const WORKERS = 2;
+    private const LINE_MAX = 128;
+    private const PATH_START = 19;
+    private const DATE_BITS = 12;
+    private const DATE_MASK = 0xFFF;
+
     public function parse(string $inputPath, string $outputPath): void
     {
         \gc_disable();
-        @\set_time_limit(0);
-        @\ini_set('memory_limit', '1536M');
+        \set_time_limit(0);
+        \ini_set('memory_limit', '1536M');
 
-        // ---- TUNABLES for DO 2vCPU / 1.5GB ----
-        $bucketCount = 8192;     // power of 2
-        $groupSize   = 256;      // power of 2, <=256 so bucketOffset fits in 1 byte
-        $groupShift  = 8;        // log2(groupSize)
-        $mask        = $bucketCount - 1;
-        $groupCount  = $bucketCount >> $groupShift;
+        if (!\is_file($inputPath)) {
+            $this->writeEmptyOutput($outputPath);
 
-        // Buffers
-        $inReadBuf      = 1 << 23; // 8MB
-        $spillWriteBuf  = 1 << 18; // 256KB
-        $spillReadBuf   = 1 << 23; // 8MB
-        $bucketWriteBuf = 1 << 18; // 256KB per open bucket stream (x256 => 64MB buffers)
-        $bucketReadBuf  = 1 << 23; // 8MB
-        $fragWriteBuf   = 1 << 24; // 16MB
-        $flushThreshold = 1 << 20; // 1MB
-
-        $workers = 2; // you said pcntl is available; droplet has 2 vCPUs
-
-        $baseDir = \dirname($outputPath);
-        $tmpDir  = $baseDir . '/.parser_tmp_' . \getmypid() . '_' . \substr(\uniqid('', true), -8);
-        if (!@\mkdir($tmpDir, 0777, true) && !\is_dir($tmpDir)) {
-            \file_put_contents($outputPath, '{}');
             return;
         }
 
-        // ============================================================
-        // PASS 1: Single scan -> group spill files
-        // Spill record: [1 byte bucketOffset][path],[YYYY-MM-DD]\n
-        // ============================================================
-        $spillH = [];
-        for ($g = 0; $g < $groupCount; $g++) {
-            $h = \fopen($tmpDir . '/s' . $g, 'wb');
-            if ($h === false) {
-                $this->cleanupTmp($tmpDir);
-                \file_put_contents($outputPath, '{}');
-                return;
+        if (!\function_exists('pcntl_fork')) {
+            $this->writeEmptyOutput($outputPath);
+
+            return;
+        }
+
+        $fileSize = \filesize($inputPath);
+        if (!\is_int($fileSize) || $fileSize <= 0) {
+            $this->writeEmptyOutput($outputPath);
+
+            return;
+        }
+
+        $tmpDir = \dirname($outputPath) . '/.parser_tmp_' . \getmypid() . '_' . \substr(\uniqid('', true), -8);
+        if (!\mkdir($tmpDir, 0777, true) && !\is_dir($tmpDir)) {
+            $this->writeEmptyOutput($outputPath);
+
+            return;
+        }
+
+        $fragFiles = [];
+        $failed = false;
+
+        try {
+            $pids = [];
+
+            for ($worker = 0; $worker < self::WORKERS; $worker++) {
+                $fragFiles[$worker] = $tmpDir . '/frag' . $worker;
+                $chunkStart = \intdiv($fileSize * $worker, self::WORKERS);
+                $chunkEnd = \intdiv($fileSize * ($worker + 1), self::WORKERS);
+
+                $pid = \pcntl_fork();
+                if ($pid === -1) {
+                    $failed = true;
+                    break;
+                }
+
+                if ($pid === 0) {
+                    $ok = $this->parseChunk($inputPath, $chunkStart, $chunkEnd, $fragFiles[$worker]);
+                    \exit($ok ? 0 : 1);
+                }
+
+                $pids[] = $pid;
             }
-            \stream_set_write_buffer($h, $spillWriteBuf);
-            $spillH[$g] = $h;
-        }
 
-        $in = \fopen($inputPath, 'rb');
-        if ($in === false) {
-            foreach ($spillH as $h) { \fclose($h); }
-            $this->cleanupTmp($tmpDir);
-            \file_put_contents($outputPath, '{}');
-            return;
-        }
-        \stream_set_read_buffer($in, $inReadBuf);
+            foreach ($pids as $pid) {
+                $status = 0;
+                \pcntl_waitpid($pid, $status);
 
-        while (($line = \fgets($in)) !== false) {
-            $comma = \strpos($line, ',');
-            if ($comma === false) continue;
-
-            $date = \substr($line, $comma + 1, 10);
-
-            if ($line[0] === '/') {
-                $path = \substr($line, 0, $comma);
-            } else {
-                $slash = \strpos($line, '/', 8);
-                if ($slash === false || $slash >= $comma) {
-                    $path = \substr($line, 0, $comma);
-                } else {
-                    $path = \substr($line, $slash, $comma - $slash);
+                if (!\pcntl_wifexited($status) || \pcntl_wexitstatus($status) !== 0) {
+                    $failed = true;
                 }
             }
 
-            $bucket = \crc32($path) & $mask;
-            $g      = $bucket >> $groupShift;
-            $off    = $bucket & ($groupSize - 1);
+            if ($failed) {
+                $this->writeEmptyOutput($outputPath);
 
-            \fwrite($spillH[$g], \chr($off) . $path . ',' . $date . "\n");
+                return;
+            }
+
+            if (!$this->mergeFragments($fragFiles, $outputPath)) {
+                $this->writeEmptyOutput($outputPath);
+            }
+        } finally {
+            $this->cleanupTmpDir($tmpDir);
+        }
+    }
+
+    private function parseChunk(string $inputPath, int $chunkStart, int $chunkEnd, string $fragmentPath): bool
+    {
+        $input = \fopen($inputPath, 'rb');
+        if ($input === false) {
+            return false;
         }
 
-        \fclose($in);
-        foreach ($spillH as $h) { \fclose($h); }
+        if ($chunkStart > 0) {
+            if (\fseek($input, $chunkStart - 1) !== 0) {
+                \fclose($input);
 
-        // ============================================================
-        // PASS 2+3 in parallel: for each group -> route into buckets -> reduce -> fragment
-        // ============================================================
-        $fragFiles = [
-            $tmpDir . '/frag0',
-            $tmpDir . '/frag1',
-        ];
+                return false;
+            }
 
-        $pids = [];
-        for ($w = 0; $w < $workers; $w++) {
-            $pid = \pcntl_fork();
-            if ($pid === -1) {
-                // Fork failed; fall back to single worker (run in parent)
-                $workers = 1;
+            \fgets($input, self::LINE_MAX);
+        } else {
+            if (\fseek($input, 0) !== 0) {
+                \fclose($input);
+
+                return false;
+            }
+        }
+
+        $pos = \ftell($input);
+        if (!\is_int($pos)) {
+            \fclose($input);
+
+            return false;
+        }
+
+        $pathToId = [];
+        $paths = [];
+        $dateToId = [];
+        $dates = [];
+        $firstOffsets = [];
+        $counts = [];
+
+        while (($line = \fgets($input, self::LINE_MAX)) !== false) {
+            $lineStart = $pos;
+            $lineLength = \strlen($line);
+            $pos += $lineLength;
+
+            if ($lineStart >= $chunkEnd) {
                 break;
             }
 
-            if ($pid === 0) {
-                // CHILD
-                $frag = $fragFiles[$w];
-                $fh = \fopen($frag, 'wb');
-                if ($fh === false) {
-                    \exit(1);
-                }
-                \stream_set_write_buffer($fh, $fragWriteBuf);
-
-                $firstTop = true;
-                $buf = '';
-
-                for ($g = $w; $g < $groupCount; $g += $workers) {
-                    $spillFile = $tmpDir . '/s' . $g;
-                    if (!\is_file($spillFile) || \filesize($spillFile) === 0) {
-                        @\unlink($spillFile);
-                        continue;
-                    }
-
-                    // ---- route spill -> 256 bucket files (only for this group) ----
-                    $gDir = $tmpDir . '/g' . $g;
-                    @\mkdir($gDir, 0777, true);
-
-                    $bucketH = [];
-                    for ($off = 0; $off < $groupSize; $off++) {
-                        $bh = \fopen($gDir . '/' . $off, 'wb');
-                        if ($bh === false) {
-                            foreach ($bucketH as $x) { \fclose($x); }
-                            \fclose($fh);
-                            \exit(2);
-                        }
-                        \stream_set_write_buffer($bh, $bucketWriteBuf);
-                        $bucketH[$off] = $bh;
-                    }
-
-                    $sh = \fopen($spillFile, 'rb');
-                    if ($sh === false) {
-                        foreach ($bucketH as $x) { \fclose($x); }
-                        \fclose($fh);
-                        \exit(3);
-                    }
-                    \stream_set_read_buffer($sh, $spillReadBuf);
-
-                    while (($rec = \fgets($sh)) !== false) {
-                        $off = \ord($rec[0]);
-                        // Write whole line (includes off byte). Avoid substr() copy here.
-                        \fwrite($bucketH[$off], $rec);
-                    }
-
-                    \fclose($sh);
-                    @\unlink($spillFile);
-                    foreach ($bucketH as $x) { \fclose($x); }
-
-                    // ---- reduce each bucket immediately -> fragment ----
-                    for ($off = 0; $off < $groupSize; $off++) {
-                        $bf = $gDir . '/' . $off;
-                        if (!\is_file($bf) || \filesize($bf) === 0) {
-                            @\unlink($bf);
-                            continue;
-                        }
-
-                        $bh = \fopen($bf, 'rb');
-                        if ($bh === false) {
-                            @\unlink($bf);
-                            continue;
-                        }
-                        \stream_set_read_buffer($bh, $bucketReadBuf);
-
-                        $map = [];
-                        while (($line = \fgets($bh)) !== false) {
-                            // [1 byte off][path],[YYYY-MM-DD]\n
-                            $comma = \strpos($line, ',', 1);
-                            if ($comma === false) continue;
-
-                            $path = \substr($line, 1, $comma - 1);
-                            $date = \substr($line, $comma + 1, 10);
-
-                            if (isset($map[$path][$date])) {
-                                ++$map[$path][$date];
-                            } else {
-                                $map[$path][$date] = 1;
-                            }
-                        }
-                        \fclose($bh);
-                        @\unlink($bf);
-
-                        foreach ($map as $path => $dates) {
-                            if ($firstTop) $firstTop = false;
-                            else $buf .= ',';
-
-                            $buf .= '"' . $path . '":{';
-
-                            $firstDate = true;
-                            foreach ($dates as $date => $count) {
-                                if ($firstDate) $firstDate = false;
-                                else $buf .= ',';
-                                $buf .= '"' . $date . '":' . $count;
-                            }
-
-                            $buf .= '}';
-
-                            if (\strlen($buf) >= $flushThreshold) {
-                                \fwrite($fh, $buf);
-                                $buf = '';
-                            }
-                        }
-
-                        unset($map);
-                    }
-
-                    @\rmdir($gDir);
-                }
-
-                if ($buf !== '') \fwrite($fh, $buf);
-                \fclose($fh);
-                \exit(0);
-            }
-
-            // PARENT
-            $pids[] = $pid;
-        }
-
-        if ($workers === 1) {
-            // No fork; do child work in-process and write to frag0.
-            $frag = $fragFiles[0];
-            $fh = \fopen($frag, 'wb');
-            if ($fh === false) {
-                $this->cleanupTmp($tmpDir);
-                \file_put_contents($outputPath, '{}');
-                return;
-            }
-            \stream_set_write_buffer($fh, $fragWriteBuf);
-
-            $firstTop = true;
-            $buf = '';
-
-            for ($g = 0; $g < $groupCount; $g++) {
-                $spillFile = $tmpDir . '/s' . $g;
-                if (!\is_file($spillFile) || \filesize($spillFile) === 0) {
-                    @\unlink($spillFile);
-                    continue;
-                }
-
-                $gDir = $tmpDir . '/g' . $g;
-                @\mkdir($gDir, 0777, true);
-
-                $bucketH = [];
-                for ($off = 0; $off < $groupSize; $off++) {
-                    $bh = \fopen($gDir . '/' . $off, 'wb');
-                    if ($bh === false) {
-                        foreach ($bucketH as $x) { \fclose($x); }
-                        \fclose($fh);
-                        $this->cleanupTmp($tmpDir);
-                        \file_put_contents($outputPath, '{}');
-                        return;
-                    }
-                    \stream_set_write_buffer($bh, $bucketWriteBuf);
-                    $bucketH[$off] = $bh;
-                }
-
-                $sh = \fopen($spillFile, 'rb');
-                if ($sh === false) {
-                    foreach ($bucketH as $x) { \fclose($x); }
-                    \fclose($fh);
-                    $this->cleanupTmp($tmpDir);
-                    \file_put_contents($outputPath, '{}');
-                    return;
-                }
-                \stream_set_read_buffer($sh, $spillReadBuf);
-
-                while (($rec = \fgets($sh)) !== false) {
-                    $off = \ord($rec[0]);
-                    \fwrite($bucketH[$off], $rec);
-                }
-
-                \fclose($sh);
-                @\unlink($spillFile);
-                foreach ($bucketH as $x) { \fclose($x); }
-
-                for ($off = 0; $off < $groupSize; $off++) {
-                    $bf = $gDir . '/' . $off;
-                    if (!\is_file($bf) || \filesize($bf) === 0) {
-                        @\unlink($bf);
-                        continue;
-                    }
-
-                    $bh = \fopen($bf, 'rb');
-                    if ($bh === false) {
-                        @\unlink($bf);
-                        continue;
-                    }
-                    \stream_set_read_buffer($bh, $bucketReadBuf);
-
-                    $map = [];
-                    while (($line = \fgets($bh)) !== false) {
-                        $comma = \strpos($line, ',', 1);
-                        if ($comma === false) continue;
-
-                        $path = \substr($line, 1, $comma - 1);
-                        $date = \substr($line, $comma + 1, 10);
-
-                        if (isset($map[$path][$date])) ++$map[$path][$date];
-                        else $map[$path][$date] = 1;
-                    }
-
-                    \fclose($bh);
-                    @\unlink($bf);
-
-                    foreach ($map as $path => $dates) {
-                        if ($firstTop) $firstTop = false;
-                        else $buf .= ',';
-
-                        $buf .= '"' . $path . '":{';
-
-                        $firstDate = true;
-                        foreach ($dates as $date => $count) {
-                            if ($firstDate) $firstDate = false;
-                            else $buf .= ',';
-                            $buf .= '"' . $date . '":' . $count;
-                        }
-
-                        $buf .= '}';
-
-                        if (\strlen($buf) >= $flushThreshold) {
-                            \fwrite($fh, $buf);
-                            $buf = '';
-                        }
-                    }
-
-                    unset($map);
-                }
-
-                @\rmdir($gDir);
-            }
-
-            if ($buf !== '') \fwrite($fh, $buf);
-            \fclose($fh);
-        } else {
-            foreach ($pids as $pid) {
-                \pcntl_waitpid($pid, $status);
-            }
-        }
-
-        // ============================================================
-        // FINAL MERGE: { frag0 , frag1 }
-        // ============================================================
-        $outH = \fopen($outputPath, 'wb');
-        if ($outH === false) {
-            \file_put_contents($outputPath, '{}');
-            return;
-        }
-        \stream_set_write_buffer($outH, $fragWriteBuf);
-
-        \fwrite($outH, '{');
-
-        $wroteAny = false;
-        for ($i = 0; $i < 2; $i++) {
-            $frag = $fragFiles[$i];
-            if (!\is_file($frag) || \filesize($frag) === 0) {
-                @\unlink($frag);
+            $comma = \strpos($line, ',');
+            if ($comma === false || $comma <= self::PATH_START) {
                 continue;
             }
 
-            if ($wroteAny) \fwrite($outH, ',');
-            $wroteAny = true;
+            $path = \substr($line, self::PATH_START, $comma - self::PATH_START);
+            $date = \substr($line, $comma + 1, 10);
 
-            $fh = \fopen($frag, 'rb');
-            if ($fh !== false) {
-                \stream_copy_to_stream($fh, $outH);
-                \fclose($fh);
+            if (!isset($pathToId[$path])) {
+                $pathId = \count($paths);
+                $pathToId[$path] = $pathId;
+                $paths[$pathId] = $path;
+                $firstOffsets[$pathId] = $lineStart;
+            } else {
+                $pathId = $pathToId[$path];
             }
-            @\unlink($frag);
+
+            if (!isset($dateToId[$date])) {
+                $dateId = \count($dates);
+                if ($dateId > self::DATE_MASK) {
+                    \fclose($input);
+
+                    return false;
+                }
+
+                $dateToId[$date] = $dateId;
+                $dates[$dateId] = $date;
+            } else {
+                $dateId = $dateToId[$date];
+            }
+
+            $key = ($pathId << self::DATE_BITS) | $dateId;
+            if (isset($counts[$key])) {
+                ++$counts[$key];
+            } else {
+                $counts[$key] = 1;
+            }
         }
 
-        \fwrite($outH, '}');
-        \fclose($outH);
+        \fclose($input);
+
+        $fragment = \fopen($fragmentPath, 'wb');
+        if ($fragment === false) {
+            return false;
+        }
+
+        $payload = \serialize([$paths, $dates, $counts, $firstOffsets]);
+        $written = \fwrite($fragment, $payload);
+        \fclose($fragment);
+
+        return \is_int($written) && $written === \strlen($payload);
+    }
+
+    private function mergeFragments(array $fragmentPaths, string $outputPath): bool
+    {
+        $globalPathToId = [];
+        $globalPaths = [];
+        $globalPathFirst = [];
+
+        $globalDateToId = [];
+        $globalDates = [];
+
+        $globalCounts = [];
+
+        foreach ($fragmentPaths as $fragmentPath) {
+            $payload = $this->loadFragment($fragmentPath);
+            if ($payload === null) {
+                return false;
+            }
+
+            [$workerPaths, $workerDates, $workerCounts, $workerFirstOffsets] = $payload;
+
+            $pathIdRemap = [];
+            foreach ($workerPaths as $workerPathId => $path) {
+                if (isset($globalPathToId[$path])) {
+                    $globalPathId = $globalPathToId[$path];
+                } else {
+                    $globalPathId = \count($globalPaths);
+                    $globalPathToId[$path] = $globalPathId;
+                    $globalPaths[$globalPathId] = $path;
+                }
+
+                $pathIdRemap[$workerPathId] = $globalPathId;
+
+                $offset = $workerFirstOffsets[$workerPathId] ?? null;
+                if (\is_int($offset) && (!isset($globalPathFirst[$globalPathId]) || $offset < $globalPathFirst[$globalPathId])) {
+                    $globalPathFirst[$globalPathId] = $offset;
+                }
+            }
+
+            $dateIdRemap = [];
+            foreach ($workerDates as $workerDateId => $date) {
+                if (isset($globalDateToId[$date])) {
+                    $globalDateId = $globalDateToId[$date];
+                } else {
+                    $globalDateId = \count($globalDates);
+                    if ($globalDateId > self::DATE_MASK) {
+                        return false;
+                    }
+
+                    $globalDateToId[$date] = $globalDateId;
+                    $globalDates[$globalDateId] = $date;
+                }
+
+                $dateIdRemap[$workerDateId] = $globalDateId;
+            }
+
+            foreach ($workerCounts as $workerKey => $count) {
+                if (!\is_int($count) || $count < 1) {
+                    continue;
+                }
+
+                $workerPathId = $workerKey >> self::DATE_BITS;
+                $workerDateId = $workerKey & self::DATE_MASK;
+
+                if (!isset($pathIdRemap[$workerPathId], $dateIdRemap[$workerDateId])) {
+                    continue;
+                }
+
+                $globalPathId = $pathIdRemap[$workerPathId];
+                $globalDateId = $dateIdRemap[$workerDateId];
+                $globalKey = ($globalPathId << self::DATE_BITS) | $globalDateId;
+
+                if (isset($globalCounts[$globalKey])) {
+                    $globalCounts[$globalKey] += $count;
+                } else {
+                    $globalCounts[$globalKey] = $count;
+                }
+            }
+        }
+
+        \asort($globalPathFirst, \SORT_NUMERIC);
+
+        $perPathDates = [];
+        foreach ($globalCounts as $globalKey => $count) {
+            $pathId = $globalKey >> self::DATE_BITS;
+            $dateId = $globalKey & self::DATE_MASK;
+
+            if (!isset($globalDates[$dateId])) {
+                continue;
+            }
+
+            $perPathDates[$pathId][$globalDates[$dateId]] = $count;
+        }
+
+        $ordered = [];
+        foreach ($globalPathFirst as $pathId => $_offset) {
+            if (!isset($globalPaths[$pathId])) {
+                continue;
+            }
+
+            $dates = $perPathDates[$pathId] ?? [];
+            if ($dates !== []) {
+                \ksort($dates, \SORT_STRING);
+            }
+
+            $ordered[$globalPaths[$pathId]] = $dates;
+        }
+
+        $json = \json_encode($ordered, \JSON_PRETTY_PRINT);
+        if (!\is_string($json)) {
+            return false;
+        }
+
+        $written = \file_put_contents($outputPath, $json);
+
+        return \is_int($written);
+    }
+
+    private function loadFragment(string $fragmentPath): ?array
+    {
+        if (!\is_file($fragmentPath)) {
+            return null;
+        }
+
+        $raw = \file_get_contents($fragmentPath);
+        if (!\is_string($raw) || $raw === '') {
+            return null;
+        }
+
+        $decoded = \unserialize($raw, ['allowed_classes' => false]);
+        if (!\is_array($decoded) || \count($decoded) !== 4) {
+            return null;
+        }
+
+        return $decoded;
+    }
+
+    private function cleanupTmpDir(string $tmpDir): void
+    {
+        if (!\is_dir($tmpDir)) {
+            return;
+        }
+
+        $entries = \scandir($tmpDir);
+        if ($entries === false) {
+            return;
+        }
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+
+            $path = $tmpDir . '/' . $entry;
+            if (\is_dir($path)) {
+                $this->cleanupTmpDir($path);
+                if (\is_dir($path)) {
+                    \rmdir($path);
+                }
+
+                continue;
+            }
+
+            if (\is_file($path)) {
+                \unlink($path);
+            }
+        }
+
+        if (\is_dir($tmpDir)) {
+            \rmdir($tmpDir);
+        }
+    }
+
+    private function writeEmptyOutput(string $outputPath): void
+    {
+        \file_put_contents($outputPath, '{}');
     }
 }
