@@ -5,7 +5,6 @@ namespace App;
 final class Parser
 {
     private const WORKERS = 2;
-    private const LINE_MAX = 128;
     private const PATH_START = 19;
     private const DATE_BITS = 12;
     private const DATE_MASK = 0xFFF;
@@ -104,7 +103,7 @@ final class Parser
                 return false;
             }
 
-            \fgets($input, self::LINE_MAX);
+            \fgets($input);
         } else {
             if (\fseek($input, 0) !== 0) {
                 \fclose($input);
@@ -127,7 +126,7 @@ final class Parser
         $firstOffsets = [];
         $counts = [];
 
-        while (($line = \fgets($input, self::LINE_MAX)) !== false) {
+        while (($line = \fgets($input)) !== false) {
             $lineStart = $pos;
             $lineLength = \strlen($line);
             $pos += $lineLength;
@@ -137,10 +136,6 @@ final class Parser
             }
 
             $comma = \strpos($line, ',');
-            if ($comma === false || $comma <= self::PATH_START) {
-                continue;
-            }
-
             $path = \substr($line, self::PATH_START, $comma - self::PATH_START);
             $date = \substr($line, $comma + 1, 10);
 
