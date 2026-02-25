@@ -5,9 +5,12 @@ namespace App;
 final class Parser
 {
     private const WORKERS = 3;
-    private const PATH_START = 19;
     private const DATE_BITS = 12;
     private const DATE_MASK = 0xFFF;
+    private const READ_BLOCK_SIZE = 1 << 20; // 1MB
+    private const PATH_PREFIX_OFFSET = 25;   // "https://stitcher.io/blog/"
+    private const PATH_FIXED_SUFFIX = 51;    // "," + ISO8601 tail
+    private const DATE_TAIL_OFFSET = 25;     // chars between date start and line end
 
     public function parse(string $inputPath, string $outputPath): void
     {
@@ -45,12 +48,20 @@ final class Parser
         $failed = false;
 
         try {
+            $boundaries = $this->computeChunkBoundaries($inputPath, $fileSize, self::WORKERS);
+            if ($boundaries === null) {
+                $this->writeEmptyOutput($outputPath);
+
+                return;
+            }
+
             $pids = [];
 
             for ($worker = 0; $worker < self::WORKERS; $worker++) {
                 $fragFiles[$worker] = $tmpDir . '/frag' . $worker;
-                $chunkStart = \intdiv($fileSize * $worker, self::WORKERS);
-                $chunkEnd = \intdiv($fileSize * ($worker + 1), self::WORKERS);
+                $chunkStart = $boundaries[$worker];
+                $chunkEnd = $boundaries[$worker + 1];
+                $isLastChunk = $worker === self::WORKERS - 1;
 
                 $pid = \pcntl_fork();
                 if ($pid === -1) {
@@ -59,7 +70,7 @@ final class Parser
                 }
 
                 if ($pid === 0) {
-                    $ok = $this->parseChunk($inputPath, $chunkStart, $chunkEnd, $fragFiles[$worker]);
+                    $ok = $this->parseChunk($inputPath, $chunkStart, $chunkEnd, $isLastChunk, $fragFiles[$worker]);
                     \exit($ok ? 0 : 1);
                 }
 
@@ -89,35 +100,66 @@ final class Parser
         }
     }
 
-    private function parseChunk(string $inputPath, int $chunkStart, int $chunkEnd, string $fragmentPath): bool
+    private function computeChunkBoundaries(string $inputPath, int $fileSize, int $workers): ?array
+    {
+        $input = \fopen($inputPath, 'rb');
+        if ($input === false) {
+            return null;
+        }
+
+        $boundaries = [0];
+
+        for ($worker = 1; $worker < $workers; $worker++) {
+            $target = \intdiv($fileSize * $worker, $workers);
+            if ($target <= 0 || $target >= $fileSize) {
+                \fclose($input);
+
+                return null;
+            }
+
+            if (\fseek($input, $target - 1) !== 0) {
+                \fclose($input);
+
+                return null;
+            }
+
+            \fgets($input);
+            $boundary = \ftell($input);
+            if (!\is_int($boundary) || $boundary <= $boundaries[$worker - 1] || $boundary > $fileSize) {
+                \fclose($input);
+
+                return null;
+            }
+
+            $boundaries[] = $boundary;
+        }
+
+        \fclose($input);
+        $boundaries[] = $fileSize;
+
+        return $boundaries;
+    }
+
+    private function parseChunk(
+        string $inputPath,
+        int $chunkStart,
+        int $chunkEnd,
+        bool $isLastChunk,
+        string $fragmentPath
+    ): bool
     {
         $input = \fopen($inputPath, 'rb');
         if ($input === false) {
             return false;
         }
 
-        if ($chunkStart > 0) {
-            if (\fseek($input, $chunkStart - 1) !== 0) {
-                \fclose($input);
-
-                return false;
-            }
-
-            \fgets($input);
-        } else {
-            if (\fseek($input, 0) !== 0) {
-                \fclose($input);
-
-                return false;
-            }
-        }
-
-        $pos = \ftell($input);
-        if (!\is_int($pos)) {
+        if ($chunkEnd < $chunkStart || \fseek($input, $chunkStart) !== 0) {
             \fclose($input);
 
             return false;
         }
+
+        $remaining = $chunkEnd - $chunkStart;
 
         $pathToId = [];
         $paths = [];
@@ -126,24 +168,98 @@ final class Parser
         $firstOffsets = [];
         $counts = [];
 
-        while (($line = \fgets($input)) !== false) {
-            $lineStart = $pos;
-            $lineLength = \strlen($line);
-            $pos += $lineLength;
+        $carry = '';
+        $carryOffset = $chunkStart;
 
-            if ($lineStart >= $chunkEnd) {
-                break;
+        while ($remaining > 0) {
+            $readSize = $remaining > self::READ_BLOCK_SIZE ? self::READ_BLOCK_SIZE : $remaining;
+            $chunk = \fread($input, $readSize);
+            if (!\is_string($chunk)) {
+                \fclose($input);
+
+                return false;
             }
 
-            $comma = \strpos($line, ',');
-            $path = \substr($line, self::PATH_START, $comma - self::PATH_START);
-            $date = \substr($line, $comma + 1, 10);
+            $chunkLength = \strlen($chunk);
+            if ($chunkLength === 0) {
+                \fclose($input);
+
+                return false;
+            }
+
+            $remaining -= $chunkLength;
+
+            $buffer = $carry . $chunk;
+            $bufferOffset = $carryOffset;
+
+            $lineStart = 0;
+            while (true) {
+                $newline = \strpos($buffer, "\n", $lineStart);
+                if ($newline === false) {
+                    break;
+                }
+
+                $lineLength = $newline - $lineStart;
+                $path = \substr(
+                    $buffer,
+                    $lineStart + self::PATH_PREFIX_OFFSET,
+                    $lineLength - self::PATH_FIXED_SUFFIX
+                );
+                $date = \substr($buffer, $newline - self::DATE_TAIL_OFFSET, 10);
+
+                if (!isset($pathToId[$path])) {
+                    $pathId = \count($paths);
+                    $pathToId[$path] = $pathId;
+                    $paths[$pathId] = $path;
+                    $firstOffsets[$pathId] = $bufferOffset + $lineStart;
+                } else {
+                    $pathId = $pathToId[$path];
+                }
+
+                if (!isset($dateToId[$date])) {
+                    $dateId = \count($dates);
+                    if ($dateId > self::DATE_MASK) {
+                        \fclose($input);
+
+                        return false;
+                    }
+
+                    $dateToId[$date] = $dateId;
+                    $dates[$dateId] = $date;
+                } else {
+                    $dateId = $dateToId[$date];
+                }
+
+                $key = ($pathId << self::DATE_BITS) | $dateId;
+                if (isset($counts[$key])) {
+                    ++$counts[$key];
+                } else {
+                    $counts[$key] = 1;
+                }
+
+                $lineStart = $newline + 1;
+            }
+
+            $carry = \substr($buffer, $lineStart);
+            $carryOffset = $bufferOffset + $lineStart;
+        }
+
+        if ($carry !== '') {
+            if (!$isLastChunk) {
+                \fclose($input);
+
+                return false;
+            }
+
+            $lineLength = \strlen($carry);
+            $path = \substr($carry, self::PATH_PREFIX_OFFSET, $lineLength - self::PATH_FIXED_SUFFIX);
+            $date = \substr($carry, $lineLength - self::DATE_TAIL_OFFSET, 10);
 
             if (!isset($pathToId[$path])) {
                 $pathId = \count($paths);
                 $pathToId[$path] = $pathId;
                 $paths[$pathId] = $path;
-                $firstOffsets[$pathId] = $lineStart;
+                $firstOffsets[$pathId] = $carryOffset;
             } else {
                 $pathId = $pathToId[$path];
             }
@@ -187,7 +303,7 @@ final class Parser
     private function mergeFragments(array $fragmentPaths, string $outputPath): bool
     {
         $globalPathToId = [];
-        $globalPaths = [];
+        $globalSlugs = [];
         $globalPathFirst = [];
 
         $globalDateToId = [];
@@ -208,9 +324,9 @@ final class Parser
                 if (isset($globalPathToId[$path])) {
                     $globalPathId = $globalPathToId[$path];
                 } else {
-                    $globalPathId = \count($globalPaths);
+                    $globalPathId = \count($globalSlugs);
                     $globalPathToId[$path] = $globalPathId;
-                    $globalPaths[$globalPathId] = $path;
+                    $globalSlugs[$globalPathId] = $path;
                 }
 
                 $pathIdRemap[$workerPathId] = $globalPathId;
@@ -276,10 +392,26 @@ final class Parser
             $perPathDates[$pathId][$globalDates[$dateId]] = $count;
         }
 
-        $ordered = [];
+        $output = \fopen($outputPath, 'wb');
+        if ($output === false) {
+            return false;
+        }
+
+        \stream_set_write_buffer($output, self::READ_BLOCK_SIZE);
+        \fwrite($output, '{');
+
+        $firstPath = true;
         foreach ($globalPathFirst as $pathId => $_offset) {
-            if (!isset($globalPaths[$pathId])) {
+            $slug = $globalSlugs[$pathId] ?? null;
+            if (!\is_string($slug)) {
                 continue;
+            }
+
+            $pathKey = \json_encode('/blog/' . $slug);
+            if (!\is_string($pathKey)) {
+                \fclose($output);
+
+                return false;
             }
 
             $dates = $perPathDates[$pathId] ?? [];
@@ -287,17 +419,48 @@ final class Parser
                 \ksort($dates, \SORT_STRING);
             }
 
-            $ordered[$globalPaths[$pathId]] = $dates;
+            if ($firstPath) {
+                $firstPath = false;
+            } else {
+                \fwrite($output, ',');
+            }
+
+            \fwrite($output, "\n    {$pathKey}: {");
+
+            $firstDate = true;
+            foreach ($dates as $date => $count) {
+                if (!\is_int($count) || $count < 1) {
+                    continue;
+                }
+
+                $dateKey = \json_encode($date);
+                if (!\is_string($dateKey)) {
+                    \fclose($output);
+
+                    return false;
+                }
+
+                if ($firstDate) {
+                    $firstDate = false;
+                } else {
+                    \fwrite($output, ',');
+                }
+
+                \fwrite($output, "\n        {$dateKey}: {$count}");
+            }
+
+            \fwrite($output, "\n    }");
         }
 
-        $json = \json_encode($ordered, \JSON_PRETTY_PRINT);
-        if (!\is_string($json)) {
-            return false;
+        if ($firstPath) {
+            \fwrite($output, '}');
+        } else {
+            \fwrite($output, "\n}");
         }
 
-        $written = \file_put_contents($outputPath, $json);
+        \fclose($output);
 
-        return \is_int($written);
+        return true;
     }
 
     private function loadFragment(string $fragmentPath): ?array
