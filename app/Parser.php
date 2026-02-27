@@ -2,1079 +2,361 @@
 
 namespace App;
 
-use App\Commands\Visit;
-
 final class Parser
 {
-    private const WORKERS = 3;
-    private const READ_BLOCK_SIZE = 1 << 20; // 1 MiB
-    private const DATE_BITS = 12;
-    private const DATE_MASK = 0xFFF;
-    private const PATH_PREFIX_OFFSET = 25; // "https://stitcher.io/blog/"
-    private const PATH_FIXED_SUFFIX = 51;  // ",YYYY-MM-DDTHH:MM:SS+00:00"
-    private const DATE_TAIL_OFFSET = 25;   // chars from date start to line end
-    private const UNKNOWN_OFFSET_SENTINEL = -1;
+    private const FALLBACK_SQL_VARIABLE_LIMIT = 999;
+    private const STITCHER_PATH_OFFSET = 19;
+    private const VISIT_INSERT_PARAM_COUNT = 3;
+    private const READ_CHUNK_BYTES = 8 * 1024 * 1024;
 
     public function parse(string $inputPath, string $outputPath): void
     {
-        \gc_disable();
-        \set_time_limit(0);
-        \ini_set('memory_limit', '1536M');
+        gc_disable();
 
-        if (!\is_file($inputPath)) {
-            $this->writeEmptyOutput($outputPath);
+        $db = new \PDO('sqlite::memory:');
+        $db->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        $db->setAttribute(\PDO::ATTR_EMULATE_PREPARES, false);
 
-            return;
-        }
+        $sqlVariableLimit = $this->detectSqlVariableLimit($db);
+        $maxVisitInsertBatchRows = max(1, intdiv($sqlVariableLimit, self::VISIT_INSERT_PARAM_COUNT));
+        $configuredBatchRows = $this->readPositiveIntEnv('PARSER_INSERT_BATCH_ROWS', PHP_INT_MAX);
+        $visitInsertBatchRows = min($configuredBatchRows, $maxVisitInsertBatchRows);
 
-        if (!\function_exists('pcntl_fork') || !\function_exists('stream_socket_pair') || !\function_exists('stream_select')) {
-            $this->writeEmptyOutput($outputPath);
+        $db->exec('PRAGMA journal_mode = OFF;');
+        $db->exec('PRAGMA synchronous = OFF;');
+        $db->exec('PRAGMA temp_store = MEMORY;');
+        $db->exec('PRAGMA locking_mode = EXCLUSIVE;');
+        $db->exec('PRAGMA automatic_index = OFF;');
+        $db->exec('PRAGMA cache_size = -400000;');
+        $db->exec('PRAGMA foreign_keys = OFF;');
 
-            return;
-        }
+        $db->exec('
+            CREATE TABLE visits (
+                path TEXT NOT NULL,
+                visit_date INTEGER NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (path, visit_date)
+            ) WITHOUT ROWID
+        ');
 
-        $fileSize = \filesize($inputPath);
-        if (!\is_int($fileSize) || $fileSize <= 0) {
-            $this->writeEmptyOutput($outputPath);
+        $handle = fopen($inputPath, 'rb');
 
-            return;
-        }
-
-        [$knownSlugToId, $knownIdToSlug] = $this->buildKnownPathSpaceFromVisitAll();
-        [$knownDateToId, $knownIdToDate] = $this->buildKnownDateSpaceExactFiveYearsUtc();
-
-        $knownPathCount = \count($knownIdToSlug);
-        $knownDateCount = \count($knownIdToDate);
-
-        if ($knownDateCount === 0 || $knownDateCount > (self::DATE_MASK + 1)) {
-            $this->writeEmptyOutput($outputPath);
-
-            return;
-        }
-
-        $denseArrayLength = $knownPathCount * $knownDateCount;
-
-        $tmpDir = \dirname($outputPath) . '/.parser_tmp_' . \getmypid() . '_' . \substr(\uniqid('', true), -8);
-        if (!\mkdir($tmpDir, 0777, true) && !\is_dir($tmpDir)) {
-            $this->writeEmptyOutput($outputPath);
-
-            return;
-        }
+        $pathOrder = [];
+        $counts = [];
+        $visitInsertStatementCache = [];
 
         try {
-            $boundaries = $this->computeChunkBoundaries($inputPath, $fileSize, self::WORKERS);
-            if ($boundaries === null) {
-                $this->writeEmptyOutput($outputPath);
-
-                return;
-            }
-
-            $parentSockets = [];
-            $socketToWorker = [];
-            $pids = [];
-            $failed = false;
-
-            $ipProto = \defined('STREAM_IPPROTO_IP') ? \STREAM_IPPROTO_IP : 0;
-
-            for ($worker = 0; $worker < self::WORKERS; $worker++) {
-                $pair = \stream_socket_pair(\STREAM_PF_UNIX, \STREAM_SOCK_STREAM, $ipProto);
-                if ($pair === false) {
-                    $failed = true;
-                    break;
-                }
-
-                $chunkStart = $boundaries[$worker];
-                $chunkEnd = $boundaries[$worker + 1];
-                $isLastChunk = $worker === self::WORKERS - 1;
-
-                $pid = \pcntl_fork();
-                if ($pid === -1) {
-                    \fclose($pair[0]);
-                    \fclose($pair[1]);
-                    $failed = true;
-                    break;
-                }
-
-                if ($pid === 0) {
-                    foreach ($parentSockets as $parentSocket) {
-                        \fclose($parentSocket);
-                    }
-
-                    \fclose($pair[0]);
-
-                    $ok = $this->parseChunkAndSend(
-                        $pair[1],
-                        $inputPath,
-                        $chunkStart,
-                        $chunkEnd,
-                        $isLastChunk,
-                        $knownSlugToId,
-                        $knownDateToId,
-                        $knownPathCount,
-                        $knownDateCount
-                    );
-
-                    \fclose($pair[1]);
-                    \exit($ok ? 0 : 1);
-                }
-
-                \fclose($pair[1]);
-                \stream_set_blocking($pair[0], false);
-
-                $parentSockets[$worker] = $pair[0];
-                $socketToWorker[(int)$pair[0]] = $worker;
-                $pids[$worker] = $pid;
-            }
-
-            if ($failed) {
-                foreach ($parentSockets as $socket) {
-                    \fclose($socket);
-                }
-
-                foreach ($pids as $pid) {
-                    \pcntl_waitpid($pid, $status);
-                }
-
-                $this->writeEmptyOutput($outputPath);
-
-                return;
-            }
-
-            $workerPayloads = $this->readAllWorkerPayloads($parentSockets, $socketToWorker);
-            if ($workerPayloads === null) {
-                $failed = true;
-            }
-
-            foreach ($pids as $pid) {
-                \pcntl_waitpid($pid, $status);
-
-                if (!\pcntl_wifexited($status) || \pcntl_wexitstatus($status) !== 0) {
-                    $failed = true;
-                }
-            }
-
-            if ($failed || $workerPayloads === null) {
-                $this->writeEmptyOutput($outputPath);
-
-                return;
-            }
-
-            $globalDenseCounts = \array_fill(0, $denseArrayLength, 0);
-            $globalKnownFirstOffsets = \array_fill(0, $knownPathCount, self::UNKNOWN_OFFSET_SENTINEL);
-            $globalFallbackCounts = [];
-            $globalFallbackFirstOffsets = [];
-
-            for ($worker = 0; $worker < self::WORKERS; $worker++) {
-                $payload = $workerPayloads[$worker] ?? null;
-                if (!\is_string($payload) || !$this->mergeWorkerPayload(
-                    $payload,
-                    $denseArrayLength,
-                    $knownPathCount,
-                    $globalDenseCounts,
-                    $globalKnownFirstOffsets,
-                    $globalFallbackCounts,
-                    $globalFallbackFirstOffsets
-                )) {
-                    $this->writeEmptyOutput($outputPath);
-
-                    return;
-                }
-            }
-
-            if (!$this->writeOutput(
-                $outputPath,
-                $knownSlugToId,
-                $knownIdToSlug,
-                $knownIdToDate,
-                $knownDateCount,
-                $globalDenseCounts,
-                $globalKnownFirstOffsets,
-                $globalFallbackCounts,
-                $globalFallbackFirstOffsets
-            )) {
-                $this->writeEmptyOutput($outputPath);
-            }
-        } finally {
-            $this->cleanupTmpDir($tmpDir);
-        }
-    }
-
-    private function buildKnownPathSpaceFromVisitAll(): array
-    {
-        $knownSlugToId = [];
-        $knownIdToSlug = [];
-
-        foreach (Visit::all() as $visit) {
-            $slug = $this->extractSlugFromUri($visit->uri);
-            if (!\is_string($slug) || $slug === '') {
-                continue;
-            }
-
-            if (!isset($knownSlugToId[$slug])) {
-                $pathId = \count($knownIdToSlug);
-                $knownSlugToId[$slug] = $pathId;
-                $knownIdToSlug[$pathId] = $slug;
-            }
-        }
-
-        return [$knownSlugToId, $knownIdToSlug];
-    }
-
-    private function extractSlugFromUri(string $uri): ?string
-    {
-        $blogPos = \strpos($uri, '/blog/');
-        if ($blogPos !== false) {
-            return \substr($uri, $blogPos + 6);
-        }
-
-        if (\str_starts_with($uri, '/blog/')) {
-            return \substr($uri, 6);
-        }
-
-        return null;
-    }
-
-    private function buildKnownDateSpaceExactFiveYearsUtc(): array
-    {
-        $knownDateToId = [];
-        $knownIdToDate = [];
-
-        $today = new \DateTimeImmutable('today', new \DateTimeZone('UTC'));
-        $start = $today->sub(new \DateInterval('P5Y'));
-        $step = new \DateInterval('P1D');
-
-        for ($cursor = $start; $cursor <= $today; $cursor = $cursor->add($step)) {
-            $date = $cursor->format('Y-m-d');
-            $dateId = \count($knownIdToDate);
-            $knownDateToId[$date] = $dateId;
-            $knownIdToDate[$dateId] = $date;
-        }
-
-        return [$knownDateToId, $knownIdToDate];
-    }
-
-    private function computeChunkBoundaries(string $inputPath, int $fileSize, int $workers): ?array
-    {
-        $input = \fopen($inputPath, 'rb');
-        if ($input === false) {
-            return null;
-        }
-
-        $boundaries = [0];
-
-        for ($worker = 1; $worker < $workers; $worker++) {
-            $target = \intdiv($fileSize * $worker, $workers);
-            if ($target <= 0 || $target >= $fileSize) {
-                \fclose($input);
-
-                return null;
-            }
-
-            if (\fseek($input, $target - 1) !== 0) {
-                \fclose($input);
-
-                return null;
-            }
-
-            \fgets($input);
-            $boundary = \ftell($input);
-            if (!\is_int($boundary) || $boundary <= $boundaries[$worker - 1] || $boundary > $fileSize) {
-                \fclose($input);
-
-                return null;
-            }
-
-            $boundaries[] = $boundary;
-        }
-
-        \fclose($input);
-        $boundaries[] = $fileSize;
-
-        return $boundaries;
-    }
-
-    private function parseChunkAndSend(
-        $socket,
-        string $inputPath,
-        int $chunkStart,
-        int $chunkEnd,
-        bool $isLastChunk,
-        array $knownSlugToId,
-        array $knownDateToId,
-        int $knownPathCount,
-        int $knownDateCount
-    ): bool {
-        $input = \fopen($inputPath, 'rb');
-        if ($input === false) {
-            return false;
-        }
-
-        if ($chunkEnd < $chunkStart || \fseek($input, $chunkStart) !== 0) {
-            \fclose($input);
-
-            return false;
-        }
-
-        $denseCounts = \array_fill(0, $knownPathCount * $knownDateCount, 0);
-        $knownFirstOffsets = \array_fill(0, $knownPathCount, self::UNKNOWN_OFFSET_SENTINEL);
-        $fallbackCounts = [];
-        $fallbackFirstOffsets = [];
-
-        $remaining = $chunkEnd - $chunkStart;
-        $carry = '';
-        $carryOffset = $chunkStart;
-
-        while ($remaining > 0) {
-            $readSize = $remaining > self::READ_BLOCK_SIZE ? self::READ_BLOCK_SIZE : $remaining;
-            $chunk = \fread($input, $readSize);
-            if (!\is_string($chunk)) {
-                \fclose($input);
-
-                return false;
-            }
-
-            $chunkLength = \strlen($chunk);
-            if ($chunkLength === 0) {
-                \fclose($input);
-
-                return false;
-            }
-
-            $remaining -= $chunkLength;
-            $buffer = $carry . $chunk;
-            $bufferOffset = $carryOffset;
-
-            $lineStart = 0;
-            while (true) {
-                $newline = \strpos($buffer, "\n", $lineStart);
-                if ($newline === false) {
-                    break;
-                }
-
-                $lineLength = $newline - $lineStart;
-                $slug = \substr(
-                    $buffer,
-                    $lineStart + self::PATH_PREFIX_OFFSET,
-                    $lineLength - self::PATH_FIXED_SUFFIX
-                );
-                $date = \substr($buffer, $newline - self::DATE_TAIL_OFFSET, 10);
-                $absoluteOffset = $bufferOffset + $lineStart;
-
-                $knownPathId = $knownSlugToId[$slug] ?? null;
-                $knownDateId = $knownDateToId[$date] ?? null;
-
-                if (\is_int($knownPathId) && \is_int($knownDateId)) {
-                    $denseIndex = $knownPathId * $knownDateCount + $knownDateId;
-                    ++$denseCounts[$denseIndex];
-
-                    $existingOffset = $knownFirstOffsets[$knownPathId];
-                    if ($existingOffset === self::UNKNOWN_OFFSET_SENTINEL || $absoluteOffset < $existingOffset) {
-                        $knownFirstOffsets[$knownPathId] = $absoluteOffset;
-                    }
-                } else {
-                    if (\is_int($knownPathId)) {
-                        $existingOffset = $knownFirstOffsets[$knownPathId];
-                        if ($existingOffset === self::UNKNOWN_OFFSET_SENTINEL || $absoluteOffset < $existingOffset) {
-                            $knownFirstOffsets[$knownPathId] = $absoluteOffset;
-                        }
-                    }
-
-                    if (!isset($fallbackCounts[$slug][$date])) {
-                        $fallbackCounts[$slug][$date] = 1;
-                    } else {
-                        ++$fallbackCounts[$slug][$date];
-                    }
-
-                    $fallbackOffset = $fallbackFirstOffsets[$slug] ?? self::UNKNOWN_OFFSET_SENTINEL;
-                    if ($fallbackOffset === self::UNKNOWN_OFFSET_SENTINEL || $absoluteOffset < $fallbackOffset) {
-                        $fallbackFirstOffsets[$slug] = $absoluteOffset;
-                    }
-                }
-
-                $lineStart = $newline + 1;
-            }
-
-            $carry = \substr($buffer, $lineStart);
-            $carryOffset = $bufferOffset + $lineStart;
-        }
-
-        if ($carry !== '') {
-            if (!$isLastChunk) {
-                \fclose($input);
-
-                return false;
-            }
-
-            $lineLength = \strlen($carry);
-            $slug = \substr($carry, self::PATH_PREFIX_OFFSET, $lineLength - self::PATH_FIXED_SUFFIX);
-            $date = \substr($carry, $lineLength - self::DATE_TAIL_OFFSET, 10);
-            $absoluteOffset = $carryOffset;
-
-            $knownPathId = $knownSlugToId[$slug] ?? null;
-            $knownDateId = $knownDateToId[$date] ?? null;
-
-            if (\is_int($knownPathId) && \is_int($knownDateId)) {
-                $denseIndex = $knownPathId * $knownDateCount + $knownDateId;
-                ++$denseCounts[$denseIndex];
-
-                $existingOffset = $knownFirstOffsets[$knownPathId];
-                if ($existingOffset === self::UNKNOWN_OFFSET_SENTINEL || $absoluteOffset < $existingOffset) {
-                    $knownFirstOffsets[$knownPathId] = $absoluteOffset;
-                }
-            } else {
-                if (\is_int($knownPathId)) {
-                    $existingOffset = $knownFirstOffsets[$knownPathId];
-                    if ($existingOffset === self::UNKNOWN_OFFSET_SENTINEL || $absoluteOffset < $existingOffset) {
-                        $knownFirstOffsets[$knownPathId] = $absoluteOffset;
-                    }
-                }
-
-                if (!isset($fallbackCounts[$slug][$date])) {
-                    $fallbackCounts[$slug][$date] = 1;
-                } else {
-                    ++$fallbackCounts[$slug][$date];
-                }
-
-                $fallbackOffset = $fallbackFirstOffsets[$slug] ?? self::UNKNOWN_OFFSET_SENTINEL;
-                if ($fallbackOffset === self::UNKNOWN_OFFSET_SENTINEL || $absoluteOffset < $fallbackOffset) {
-                    $fallbackFirstOffsets[$slug] = $absoluteOffset;
-                }
-            }
-        }
-
-        \fclose($input);
-
-        $payload = $this->encodeWorkerPayload($denseCounts, $knownFirstOffsets, $fallbackCounts, $fallbackFirstOffsets);
-        if ($payload === null) {
-            return false;
-        }
-
-        return $this->writeAllToSocket($socket, $payload);
-    }
-
-    private function encodeWorkerPayload(
-        array $denseCounts,
-        array $knownFirstOffsets,
-        array $fallbackCounts,
-        array $fallbackFirstOffsets
-    ): ?string {
-        $denseCountBin = $this->packUInt32Array($denseCounts);
-        $knownFirstBin = $this->packU64Offsets($knownFirstOffsets);
-        $fallbackPayload = $this->encodeFallbackPayload($fallbackCounts, $fallbackFirstOffsets);
-        if ($fallbackPayload === null) {
-            return null;
-        }
-
-        [$fallbackMetaBin, $fallbackDataBin] = $fallbackPayload;
-
-        $header = \pack(
-            'V4',
-            \strlen($denseCountBin),
-            \strlen($knownFirstBin),
-            \strlen($fallbackMetaBin),
-            \strlen($fallbackDataBin)
-        );
-
-        return $header . $denseCountBin . $knownFirstBin . $fallbackMetaBin . $fallbackDataBin;
-    }
-
-    private function packUInt32Array(array $values): string
-    {
-        if ($values === []) {
-            return '';
-        }
-
-        $buffer = '';
-        $chunk = [];
-        $chunkCount = 0;
-        $flushSize = 4096;
-
-        foreach ($values as $value) {
-            $chunk[] = $value;
-            ++$chunkCount;
-
-            if ($chunkCount === $flushSize) {
-                $buffer .= \pack('V*', ...$chunk);
-                $chunk = [];
-                $chunkCount = 0;
-            }
-        }
-
-        if ($chunkCount > 0) {
-            $buffer .= \pack('V*', ...$chunk);
-        }
-
-        return $buffer;
-    }
-
-    private function packU64Offsets(array $offsets): string
-    {
-        $buffer = '';
-        foreach ($offsets as $offset) {
-            $buffer .= $this->packU64LE($offset);
-        }
-
-        return $buffer;
-    }
-
-    private function encodeFallbackPayload(array $fallbackCounts, array $fallbackFirstOffsets): ?array
-    {
-        $fallbackMetaBin = \pack('V', \count($fallbackFirstOffsets));
-        foreach ($fallbackFirstOffsets as $slug => $offset) {
-            $pathLength = \strlen($slug);
-            if ($pathLength > 0xFFFF) {
-                return null;
-            }
-
-            $fallbackMetaBin .= \pack('v', $pathLength) . $slug . $this->packU64LE($offset);
-        }
-
-        $recordCount = 0;
-        foreach ($fallbackCounts as $dateCounts) {
-            $recordCount += \count($dateCounts);
-        }
-
-        $fallbackDataBin = \pack('V', $recordCount);
-        foreach ($fallbackCounts as $slug => $dateCounts) {
-            $pathLength = \strlen($slug);
-            if ($pathLength > 0xFFFF) {
-                return null;
-            }
-
-            foreach ($dateCounts as $date => $count) {
-                $dateLength = \strlen($date);
-                if ($dateLength > 0xFFFF) {
-                    return null;
-                }
-
-                $fallbackDataBin .= \pack('v', $pathLength) . $slug . \pack('v', $dateLength) . $date . \pack('V', $count);
-            }
-        }
-
-        return [$fallbackMetaBin, $fallbackDataBin];
-    }
-
-    private function writeAllToSocket($socket, string $data): bool
-    {
-        $total = \strlen($data);
-        $offset = 0;
-
-        while ($offset < $total) {
-            $chunk = \substr($data, $offset, self::READ_BLOCK_SIZE);
-            $written = \fwrite($socket, $chunk);
-            if (!\is_int($written) || $written <= 0) {
-                return false;
-            }
-
-            $offset += $written;
-        }
-
-        return true;
-    }
-
-    private function readAllWorkerPayloads(array $parentSockets, array $socketToWorker): ?array
-    {
-        $payloads = \array_fill(0, self::WORKERS, '');
-        $active = $parentSockets;
-
-        while ($active !== []) {
-            $read = \array_values($active);
-            $write = null;
-            $except = null;
-
-            $selected = \stream_select($read, $write, $except, 5);
-            if ($selected === false) {
-                foreach ($active as $socket) {
-                    \fclose($socket);
-                }
-
-                return null;
-            }
-
-            if ($selected === 0) {
-                continue;
-            }
-
-            foreach ($read as $socket) {
-                $worker = $socketToWorker[(int)$socket] ?? null;
-                if (!\is_int($worker)) {
-                    foreach ($active as $openSocket) {
-                        \fclose($openSocket);
-                    }
-
-                    return null;
-                }
-
-                $chunk = \fread($socket, self::READ_BLOCK_SIZE);
+            $db->beginTransaction();
+
+            $carry = '';
+            while (! feof($handle)) {
+                $chunk = stream_get_contents($handle, self::READ_CHUNK_BYTES);
                 if ($chunk === false) {
-                    foreach ($active as $openSocket) {
-                        \fclose($openSocket);
-                    }
-
-                    return null;
+                    throw new \RuntimeException("Failed to read input file: {$inputPath}");
+                }
+                if ($chunk === '') {
+                    break;
                 }
 
-                if ($chunk === '') {
-                    if (\feof($socket)) {
-                        \fclose($socket);
-                        unset($active[$worker]);
+                $buffer = $carry . $chunk;
+                $lineStart = 0;
+
+                while (true) {
+                    $newlinePos = strpos($buffer, "\n", $lineStart);
+                    if ($newlinePos === false) {
+                        break;
                     }
 
+                    $commaPos = $newlinePos - 26;
+                    $pathStart = $lineStart + self::STITCHER_PATH_OFFSET;
+                    $path = substr($buffer, $pathStart, $commaPos - $pathStart);
+
+                    $dateStart = $newlinePos - 25;
+                    $year =
+                        ((ord($buffer[$dateStart]) - 48) * 1000) +
+                        ((ord($buffer[$dateStart + 1]) - 48) * 100) +
+                        ((ord($buffer[$dateStart + 2]) - 48) * 10) +
+                        (ord($buffer[$dateStart + 3]) - 48);
+
+                    $month =
+                        ((ord($buffer[$dateStart + 5]) - 48) * 10) +
+                        (ord($buffer[$dateStart + 6]) - 48);
+
+                    $day =
+                        ((ord($buffer[$dateStart + 8]) - 48) * 10) +
+                        (ord($buffer[$dateStart + 9]) - 48);
+
+                    $visitDate = ($year * 10000) + ($month * 100) + $day;
+                    if (! isset($counts[$path])) {
+                        $counts[$path] = [$visitDate => 1];
+                        $pathOrder[] = $path;
+                    } elseif (isset($counts[$path][$visitDate])) {
+                        $counts[$path][$visitDate]++;
+                    } else {
+                        $counts[$path][$visitDate] = 1;
+                    }
+                    $lineStart = $newlinePos + 1;
+                }
+
+                $carry = substr($buffer, $lineStart);
+            }
+
+            if ($carry !== '') {
+                $carryLength = strlen($carry);
+                $commaPos = $carryLength - 26;
+                $pathStart = self::STITCHER_PATH_OFFSET;
+                $path = substr($carry, $pathStart, $commaPos - $pathStart);
+
+                $dateStart = $carryLength - 25;
+                $year =
+                    ((ord($carry[$dateStart]) - 48) * 1000) +
+                    ((ord($carry[$dateStart + 1]) - 48) * 100) +
+                    ((ord($carry[$dateStart + 2]) - 48) * 10) +
+                    (ord($carry[$dateStart + 3]) - 48);
+
+                $month =
+                    ((ord($carry[$dateStart + 5]) - 48) * 10) +
+                    (ord($carry[$dateStart + 6]) - 48);
+
+                $day =
+                    ((ord($carry[$dateStart + 8]) - 48) * 10) +
+                    (ord($carry[$dateStart + 9]) - 48);
+
+                $visitDate = ($year * 10000) + ($month * 100) + $day;
+                if (! isset($counts[$path])) {
+                    $counts[$path] = [$visitDate => 1];
+                    $pathOrder[] = $path;
+                } elseif (isset($counts[$path][$visitDate])) {
+                    $counts[$path][$visitDate]++;
+                } else {
+                    $counts[$path][$visitDate] = 1;
+                }
+            }
+
+            $this->insertVisitsInBatches($db, $counts, $visitInsertBatchRows, $visitInsertStatementCache);
+            $db->commit();
+        } catch (\Throwable $e) {
+            if ($db->inTransaction()) {
+                $db->rollBack();
+            }
+
+            throw $e;
+        } finally {
+            fclose($handle);
+        }
+
+        $this->writeOutputStream($db, $outputPath, $pathOrder);
+    }
+
+    private function insertVisitsInBatches(
+        \PDO $db,
+        array $counts,
+        int $insertBatchRows,
+        array &$statementCache
+    ): void
+    {
+        if ($counts === []) {
+            return;
+        }
+
+        $batchRows = 0;
+        $batchParams = [];
+
+        foreach ($counts as $path => $dates) {
+            foreach ($dates as $visitDate => $count) {
+                $batchParams[] = $path;
+                $batchParams[] = $visitDate;
+                $batchParams[] = $count;
+                $batchRows++;
+
+                if ($batchRows === $insertBatchRows) {
+                    $this->executeVisitInsertBatch($db, $statementCache, $batchRows, $batchParams);
+                    $batchRows = 0;
+                    $batchParams = [];
+                }
+            }
+        }
+
+        if ($batchRows > 0) {
+            $this->executeVisitInsertBatch($db, $statementCache, $batchRows, $batchParams);
+        }
+    }
+
+    private function executeVisitInsertBatch(
+        \PDO $db,
+        array &$statementCache,
+        int $rowCount,
+        array $params
+    ): void
+    {
+        if (! isset($statementCache[$rowCount])) {
+            $values = implode(', ', array_fill(0, $rowCount, '(?, ?, ?)'));
+            $statementCache[$rowCount] = $db->prepare(
+                "INSERT INTO visits (path, visit_date, count) VALUES {$values}"
+            );
+        }
+
+        $statementCache[$rowCount]->execute($params);
+    }
+
+    private function readPositiveIntEnv(string $name, int $default): int
+    {
+        $value = getenv($name);
+        if ($value === false || $value === '') {
+            return $default;
+        }
+
+        $parsed = (int) $value;
+
+        return $parsed > 0 ? $parsed : $default;
+    }
+
+    private function detectSqlVariableLimit(\PDO $db): int
+    {
+        $pragmaLimit = $this->readPragmaMaxVariableNumber($db);
+        if ($pragmaLimit !== null && $pragmaLimit > 0) {
+            return $pragmaLimit;
+        }
+
+        $compileOptionLimit = $this->readCompileOptionMaxVariableNumber($db);
+        if ($compileOptionLimit !== null && $compileOptionLimit > 0) {
+            return $compileOptionLimit;
+        }
+
+        return self::FALLBACK_SQL_VARIABLE_LIMIT;
+    }
+
+    private function readPragmaMaxVariableNumber(\PDO $db): ?int
+    {
+        try {
+            $result = $db->query('PRAGMA max_variable_number');
+            if ($result === false) {
+                return null;
+            }
+
+            $row = $result->fetch(\PDO::FETCH_NUM);
+            if (! is_array($row) || ! isset($row[0])) {
+                return null;
+            }
+
+            $limit = (int) $row[0];
+
+            return $limit > 0 ? $limit : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function readCompileOptionMaxVariableNumber(\PDO $db): ?int
+    {
+        try {
+            $result = $db->query('PRAGMA compile_options');
+            if ($result === false) {
+                return null;
+            }
+
+            while ($row = $result->fetch(\PDO::FETCH_NUM)) {
+                $option = (string) ($row[0] ?? '');
+                if (! str_starts_with($option, 'MAX_VARIABLE_NUMBER=')) {
                     continue;
                 }
 
-                $payloads[$worker] .= $chunk;
-            }
-        }
+                $limit = (int) substr($option, strlen('MAX_VARIABLE_NUMBER='));
 
-        return $payloads;
+                return $limit > 0 ? $limit : null;
+            }
+
+            return null;
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
-    private function mergeWorkerPayload(
-        string $payload,
-        int $denseArrayLength,
-        int $knownPathCount,
-        array &$globalDenseCounts,
-        array &$globalKnownFirstOffsets,
-        array &$globalFallbackCounts,
-        array &$globalFallbackFirstOffsets
-    ): bool {
-        $decoded = $this->decodeWorkerPayload($payload, $denseArrayLength, $knownPathCount);
-        if ($decoded === null) {
-            return false;
+    private function writeOutputStream(\PDO $db, string $outputPath, array $pathOrder): void
+    {
+        $outputHandle = fopen($outputPath, 'wb');
+        if ($outputHandle === false) {
+            throw new \RuntimeException("Failed to open output file: {$outputPath}");
         }
 
-        [$denseCounts, $knownFirstOffsets, $fallbackCounts, $fallbackFirstOffsets] = $decoded;
+        $visitByPathStatement = $db->prepare('
+            SELECT
+                visit_date,
+                count
+            FROM visits
+            WHERE path = ?
+            ORDER BY visit_date ASC
+        ');
 
-        for ($i = 0; $i < $denseArrayLength; $i++) {
-            $globalDenseCounts[$i] += $denseCounts[$i];
-        }
+        fwrite($outputHandle, "{\n");
 
-        for ($i = 0; $i < $knownPathCount; $i++) {
-            $workerOffset = $knownFirstOffsets[$i];
-            if ($workerOffset === self::UNKNOWN_OFFSET_SENTINEL) {
+        $isFirstPath = true;
+        foreach ($pathOrder as $path) {
+            $visitByPathStatement->execute([$path]);
+            $row = $visitByPathStatement->fetch(\PDO::FETCH_ASSOC);
+            if ($row === false) {
+                $visitByPathStatement->closeCursor();
                 continue;
             }
 
-            $globalOffset = $globalKnownFirstOffsets[$i];
-            if ($globalOffset === self::UNKNOWN_OFFSET_SENTINEL || $workerOffset < $globalOffset) {
-                $globalKnownFirstOffsets[$i] = $workerOffset;
+            if (! $isFirstPath) {
+                fwrite($outputHandle, ",\n");
             }
+
+            $visitDate = $this->formatVisitDateForJson($row['visit_date']);
+            fwrite($outputHandle, '    ' . $this->quotePathForJson($path) . ": {\n");
+            fwrite($outputHandle, '        "' . $visitDate . '": ' . (int) $row['count']);
+
+            while ($row = $visitByPathStatement->fetch(\PDO::FETCH_ASSOC)) {
+                $visitDate = $this->formatVisitDateForJson($row['visit_date']);
+                fwrite($outputHandle, ",\n" . '        "' . $visitDate . '": ' . (int) $row['count']);
+            }
+
+            fwrite($outputHandle, "\n    }");
+            $visitByPathStatement->closeCursor();
+            $isFirstPath = false;
         }
 
-        foreach ($fallbackFirstOffsets as $slug => $workerOffset) {
-            $globalOffset = $globalFallbackFirstOffsets[$slug] ?? self::UNKNOWN_OFFSET_SENTINEL;
-            if ($globalOffset === self::UNKNOWN_OFFSET_SENTINEL || $workerOffset < $globalOffset) {
-                $globalFallbackFirstOffsets[$slug] = $workerOffset;
-            }
-        }
-
-        foreach ($fallbackCounts as $slug => $dateCounts) {
-            foreach ($dateCounts as $date => $count) {
-                if (!isset($globalFallbackCounts[$slug][$date])) {
-                    $globalFallbackCounts[$slug][$date] = $count;
-                } else {
-                    $globalFallbackCounts[$slug][$date] += $count;
-                }
-            }
-        }
-
-        return true;
+        fwrite($outputHandle, "\n}");
+        fclose($outputHandle);
     }
 
-    private function decodeWorkerPayload(string $payload, int $denseArrayLength, int $knownPathCount): ?array
+    private function formatVisitDateForJson(int|string $packedVisitDate): string
     {
-        if (\strlen($payload) < 16) {
-            return null;
+        $value = (string) $packedVisitDate;
+        if (strlen($value) !== 8 || strspn($value, '0123456789') !== 8) {
+            return $value;
         }
 
-        $header = \unpack('VdenseLen/VfirstLen/VmetaLen/VdataLen', \substr($payload, 0, 16));
-        if ($header === false) {
-            return null;
-        }
-
-        $denseLen = $header['denseLen'];
-        $firstLen = $header['firstLen'];
-        $metaLen = $header['metaLen'];
-        $dataLen = $header['dataLen'];
-
-        $expectedLength = 16 + $denseLen + $firstLen + $metaLen + $dataLen;
-        if (\strlen($payload) !== $expectedLength) {
-            return null;
-        }
-
-        if ($denseLen !== $denseArrayLength * 4) {
-            return null;
-        }
-
-        if ($firstLen !== $knownPathCount * 8) {
-            return null;
-        }
-
-        $offset = 16;
-
-        $denseBin = \substr($payload, $offset, $denseLen);
-        $offset += $denseLen;
-
-        $knownFirstBin = \substr($payload, $offset, $firstLen);
-        $offset += $firstLen;
-
-        $fallbackMetaBin = \substr($payload, $offset, $metaLen);
-        $offset += $metaLen;
-
-        $fallbackDataBin = \substr($payload, $offset, $dataLen);
-
-        $denseCountsRaw = \unpack('V*', $denseBin);
-        if ($denseCountsRaw === false || \count($denseCountsRaw) !== $denseArrayLength) {
-            return null;
-        }
-
-        $denseCounts = [];
-        for ($i = 1; $i <= $denseArrayLength; $i++) {
-            $denseCounts[] = $denseCountsRaw[$i];
-        }
-
-        $knownFirstOffsets = $this->decodeU64Offsets($knownFirstBin, $knownPathCount);
-        if ($knownFirstOffsets === null) {
-            return null;
-        }
-
-        $fallbackDecoded = $this->decodeFallbackPayload($fallbackMetaBin, $fallbackDataBin);
-        if ($fallbackDecoded === null) {
-            return null;
-        }
-
-        [$fallbackFirstOffsets, $fallbackCounts] = $fallbackDecoded;
-
-        return [$denseCounts, $knownFirstOffsets, $fallbackCounts, $fallbackFirstOffsets];
+        return substr($value, 0, 4) . '-' . substr($value, 4, 2) . '-' . substr($value, 6, 2);
     }
 
-    private function decodeU64Offsets(string $binary, int $count): ?array
+    private function quotePathForJson(string $path): string
     {
-        if (\strlen($binary) !== $count * 8) {
-            return null;
-        }
+        $length = strlen($path);
+        $needsEscaping = false;
 
-        $offsets = [];
-        $cursor = 0;
-        for ($i = 0; $i < $count; $i++) {
-            $chunk = \substr($binary, $cursor, 8);
-            $value = $this->unpackU64LE($chunk);
-            if (!\is_int($value)) {
-                return null;
-            }
+        for ($i = 0; $i < $length; $i++) {
+            $byte = ord($path[$i]);
+            if ($byte < 0x20 || $byte >= 0x80) {
+                $encoded = json_encode($path);
 
-            $offsets[] = $value;
-            $cursor += 8;
-        }
-
-        return $offsets;
-    }
-
-    private function decodeFallbackPayload(string $metaBin, string $dataBin): ?array
-    {
-        $metaOffset = 0;
-        $metaRecordCount = $this->readUInt32LE($metaBin, $metaOffset);
-        if (!\is_int($metaRecordCount)) {
-            return null;
-        }
-
-        $fallbackFirstOffsets = [];
-        for ($i = 0; $i < $metaRecordCount; $i++) {
-            $pathLength = $this->readUInt16LE($metaBin, $metaOffset);
-            if (!\is_int($pathLength)) {
-                return null;
-            }
-
-            if ($metaOffset + $pathLength + 8 > \strlen($metaBin)) {
-                return null;
-            }
-
-            $slug = \substr($metaBin, $metaOffset, $pathLength);
-            $metaOffset += $pathLength;
-
-            $offset = $this->unpackU64LE(\substr($metaBin, $metaOffset, 8));
-            if (!\is_int($offset)) {
-                return null;
-            }
-            $metaOffset += 8;
-
-            $fallbackFirstOffsets[$slug] = $offset;
-        }
-
-        if ($metaOffset !== \strlen($metaBin)) {
-            return null;
-        }
-
-        $dataOffset = 0;
-        $dataRecordCount = $this->readUInt32LE($dataBin, $dataOffset);
-        if (!\is_int($dataRecordCount)) {
-            return null;
-        }
-
-        $fallbackCounts = [];
-        for ($i = 0; $i < $dataRecordCount; $i++) {
-            $pathLength = $this->readUInt16LE($dataBin, $dataOffset);
-            if (!\is_int($pathLength)) {
-                return null;
-            }
-
-            if ($dataOffset + $pathLength > \strlen($dataBin)) {
-                return null;
-            }
-
-            $slug = \substr($dataBin, $dataOffset, $pathLength);
-            $dataOffset += $pathLength;
-
-            $dateLength = $this->readUInt16LE($dataBin, $dataOffset);
-            if (!\is_int($dateLength)) {
-                return null;
-            }
-
-            if ($dataOffset + $dateLength > \strlen($dataBin)) {
-                return null;
-            }
-
-            $date = \substr($dataBin, $dataOffset, $dateLength);
-            $dataOffset += $dateLength;
-
-            $count = $this->readUInt32LE($dataBin, $dataOffset);
-            if (!\is_int($count)) {
-                return null;
-            }
-
-            if (!isset($fallbackCounts[$slug][$date])) {
-                $fallbackCounts[$slug][$date] = $count;
-            } else {
-                $fallbackCounts[$slug][$date] += $count;
-            }
-        }
-
-        if ($dataOffset !== \strlen($dataBin)) {
-            return null;
-        }
-
-        return [$fallbackFirstOffsets, $fallbackCounts];
-    }
-
-    private function readUInt16LE(string $binary, int &$offset): ?int
-    {
-        if ($offset + 2 > \strlen($binary)) {
-            return null;
-        }
-
-        $value = \unpack('vvalue', \substr($binary, $offset, 2));
-        if ($value === false) {
-            return null;
-        }
-
-        $offset += 2;
-
-        return $value['value'];
-    }
-
-    private function readUInt32LE(string $binary, int &$offset): ?int
-    {
-        if ($offset + 4 > \strlen($binary)) {
-            return null;
-        }
-
-        $value = \unpack('Vvalue', \substr($binary, $offset, 4));
-        if ($value === false) {
-            return null;
-        }
-
-        $offset += 4;
-
-        return $value['value'];
-    }
-
-    private function packU64LE(int $value): string
-    {
-        if ($value < 0) {
-            return \pack('V2', 0xFFFFFFFF, 0xFFFFFFFF);
-        }
-
-        $low = $value & 0xFFFFFFFF;
-        $high = ($value >> 32) & 0xFFFFFFFF;
-
-        return \pack('V2', $low, $high);
-    }
-
-    private function unpackU64LE(string $bytes): ?int
-    {
-        if (\strlen($bytes) !== 8) {
-            return null;
-        }
-
-        $parts = \unpack('Vlow/Vhigh', $bytes);
-        if ($parts === false) {
-            return null;
-        }
-
-        if ($parts['low'] === 0xFFFFFFFF && $parts['high'] === 0xFFFFFFFF) {
-            return self::UNKNOWN_OFFSET_SENTINEL;
-        }
-
-        return ($parts['high'] << 32) | $parts['low'];
-    }
-
-    private function writeOutput(
-        string $outputPath,
-        array $knownSlugToId,
-        array $knownIdToSlug,
-        array $knownIdToDate,
-        int $knownDateCount,
-        array $globalDenseCounts,
-        array $globalKnownFirstOffsets,
-        array $globalFallbackCounts,
-        array $globalFallbackFirstOffsets
-    ): bool {
-        $pathFirstOffsets = [];
-
-        $knownPathCount = \count($knownIdToSlug);
-        for ($pathId = 0; $pathId < $knownPathCount; $pathId++) {
-            $offset = $globalKnownFirstOffsets[$pathId] ?? self::UNKNOWN_OFFSET_SENTINEL;
-            if ($offset === self::UNKNOWN_OFFSET_SENTINEL) {
-                continue;
-            }
-
-            $slug = $knownIdToSlug[$pathId];
-            $pathFirstOffsets[$slug] = $offset;
-        }
-
-        foreach ($globalFallbackFirstOffsets as $slug => $offset) {
-            $existing = $pathFirstOffsets[$slug] ?? self::UNKNOWN_OFFSET_SENTINEL;
-            if ($existing === self::UNKNOWN_OFFSET_SENTINEL || $offset < $existing) {
-                $pathFirstOffsets[$slug] = $offset;
-            }
-        }
-
-        \asort($pathFirstOffsets, \SORT_NUMERIC);
-
-        $output = \fopen($outputPath, 'wb');
-        if ($output === false) {
-            return false;
-        }
-
-        \stream_set_write_buffer($output, self::READ_BLOCK_SIZE);
-        \fwrite($output, '{');
-
-        $firstPath = true;
-        foreach ($pathFirstOffsets as $slug => $_offset) {
-            $dateMap = [];
-
-            $knownPathId = $knownSlugToId[$slug] ?? null;
-            if (\is_int($knownPathId)) {
-                $base = $knownPathId * $knownDateCount;
-                for ($dateId = 0; $dateId < $knownDateCount; $dateId++) {
-                    $count = $globalDenseCounts[$base + $dateId];
-                    if ($count > 0) {
-                        $date = $knownIdToDate[$dateId];
-                        $dateMap[$date] = $count;
-                    }
-                }
-            }
-
-            if (isset($globalFallbackCounts[$slug])) {
-                foreach ($globalFallbackCounts[$slug] as $date => $count) {
-                    if (!isset($dateMap[$date])) {
-                        $dateMap[$date] = $count;
-                    } else {
-                        $dateMap[$date] += $count;
-                    }
-                }
-            }
-
-            if ($dateMap !== []) {
-                \ksort($dateMap, \SORT_STRING);
-            }
-
-            $pathKey = \json_encode('/blog/' . $slug);
-            if (!\is_string($pathKey)) {
-                \fclose($output);
-
-                return false;
-            }
-
-            if ($firstPath) {
-                $firstPath = false;
-            } else {
-                \fwrite($output, ',');
-            }
-
-            \fwrite($output, "\n    {$pathKey}: {");
-
-            $firstDate = true;
-            foreach ($dateMap as $date => $count) {
-                $dateKey = \json_encode($date);
-                if (!\is_string($dateKey)) {
-                    \fclose($output);
-
-                    return false;
+                if ($encoded === false) {
+                    throw new \RuntimeException('Failed to JSON encode path');
                 }
 
-                if ($firstDate) {
-                    $firstDate = false;
-                } else {
-                    \fwrite($output, ',');
-                }
-
-                \fwrite($output, "\n        {$dateKey}: {$count}");
+                return $encoded;
             }
 
-            \fwrite($output, "\n    }");
-        }
-
-        if ($firstPath) {
-            \fwrite($output, '}');
-        } else {
-            \fwrite($output, "\n}");
-        }
-
-        \fclose($output);
-
-        return true;
-    }
-
-    private function cleanupTmpDir(string $tmpDir): void
-    {
-        if (!\is_dir($tmpDir)) {
-            return;
-        }
-
-        $entries = \scandir($tmpDir);
-        if ($entries === false) {
-            return;
-        }
-
-        foreach ($entries as $entry) {
-            if ($entry === '.' || $entry === '..') {
-                continue;
-            }
-
-            $path = $tmpDir . '/' . $entry;
-            if (\is_dir($path)) {
-                $this->cleanupTmpDir($path);
-                if (\is_dir($path)) {
-                    \rmdir($path);
-                }
-
-                continue;
-            }
-
-            if (\is_file($path)) {
-                \unlink($path);
+            if ($path[$i] === '\\' || $path[$i] === '"' || $path[$i] === '/') {
+                $needsEscaping = true;
             }
         }
 
-        if (\is_dir($tmpDir)) {
-            \rmdir($tmpDir);
+        if (! $needsEscaping) {
+            return '"' . $path . '"';
         }
-    }
 
-    private function writeEmptyOutput(string $outputPath): void
-    {
-        \file_put_contents($outputPath, '{}');
+        return '"' . str_replace(['\\', '"', '/'], ['\\\\', '\\"', '\\/'], $path) . '"';
     }
 }
